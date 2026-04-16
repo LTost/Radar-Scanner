@@ -16,87 +16,110 @@
 #define ECHO_PIN   12
 #define SERVO_PIN  14
 
-#define MAX_DIST   100  // cm, beyond this = nothing detected
-#define RADAR_R    28   // radius of radar arc on screen
-#define CX         36   // arc center X (left side to leave room)
-#define CY         56   // arc center Y (bottom)
+#define MAX_DIST     150
+#define SAMPLES      10
+
+// Radar fills full screen — center bottom, radius to top edge
+#define CX           64
+#define CY           63
+#define RADAR_R      60
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT,
 	OLED_MOSI, OLED_CLK, OLED_DC, OLED_RST, OLED_CS);
 
 Servo radar_servo;
-
 int current_angle = 0;
 int sweep_dir = 1;
-
-// Stores last detected distance per degree (0-180)
 int scan_data[181];
 
-float measure_distance() {
+float single_ping() {
 	digitalWrite(TRIG_PIN, LOW);
 	delayMicroseconds(2);
 	digitalWrite(TRIG_PIN, HIGH);
 	delayMicroseconds(10);
 	digitalWrite(TRIG_PIN, LOW);
+	long dur = pulseIn(ECHO_PIN, HIGH, 25000);
+	if (dur == 0) return MAX_DIST + 1;
+	return dur * 0.0343 / 2.0;
+}
 
-	long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout
-	if (duration == 0) return MAX_DIST + 1;
-	return duration * 0.0343 / 2.0;
+// Take 10 samples, drop top 2 and bottom 2, average the rest
+float measure_distance() {
+	float samples[SAMPLES];
+	for (int i = 0; i < SAMPLES; i++) {
+		samples[i] = single_ping();
+		delayMicroseconds(800); // min gap between pings
+	}
+	// bubble sort
+	for (int i = 0; i < SAMPLES - 1; i++)
+		for (int j = 0; j < SAMPLES - 1 - i; j++)
+			if (samples[j] > samples[j+1]) {
+				float t = samples[j]; samples[j] = samples[j+1]; samples[j+1] = t;
+			}
+	// drop 2 low + 2 high, average middle 6
+	float sum = 0;
+	for (int i = 2; i < SAMPLES - 2; i++) sum += samples[i];
+	return sum / (SAMPLES - 4);
 }
 
 void draw_radar() {
 	display.clearDisplay();
 
-	// Draw arc lines (quarter circles)
-	for (int r = RADAR_R / 3; r <= RADAR_R; r += RADAR_R / 3) {
-		for (int a = 0; a <= 180; a += 2) {
+	// Range rings at 1/3, 2/3, full radius
+	for (int ring = 1; ring <= 3; ring++) {
+		int r = (RADAR_R * ring) / 3;
+		for (int a = 0; a <= 180; a += 3) {
 			float rad = a * PI / 180.0;
-			int x = CX + r * cos(rad);
-			int y = CY - r * sin(rad);
-			display.drawPixel(x, y, WHITE);
+			int x = CX + (int)(r * cos(rad));
+			int y = CY - (int)(r * sin(rad));
+			if (x >= 0 && x < SCREEN_WIDTH && y >= 0 && y < SCREEN_HEIGHT)
+				display.drawPixel(x, y, WHITE);
 		}
 	}
 
-	// Draw base line
-	display.drawLine(CX - RADAR_R, CY, CX + RADAR_R, CY, WHITE);
-
-	// Draw center cross lines (30/60/90/120/150 deg)
-	int guide_angles[] = {30, 60, 90, 120, 150};
-	for (int a : guide_angles) {
+	// Spoke lines every 30 degrees
+	for (int a = 0; a <= 180; a += 30) {
 		float rad = a * PI / 180.0;
 		display.drawLine(CX, CY,
-			CX + RADAR_R * cos(rad),
-			CY - RADAR_R * sin(rad), WHITE);
+			CX + (int)(RADAR_R * cos(rad)),
+			CY - (int)(RADAR_R * sin(rad)), WHITE);
 	}
 
-	// Draw sweep line
-	float sweep_rad = current_angle * PI / 180.0;
-	display.drawLine(CX, CY,
-		CX + RADAR_R * cos(sweep_rad),
-		CY - RADAR_R * sin(sweep_rad), WHITE);
+	// Baseline
+	display.drawLine(CX - RADAR_R, CY, CX + RADAR_R, CY, WHITE);
 
-	// Draw detected blips
+	// Sweep line (brighter — drawn twice for weight)
+	float sweep_rad = current_angle * PI / 180.0;
+	int sx = CX + (int)(RADAR_R * cos(sweep_rad));
+	int sy = CY - (int)(RADAR_R * sin(sweep_rad));
+	display.drawLine(CX, CY, sx, sy, WHITE);
+	display.drawLine(CX + 1, CY, sx + 1, sy, WHITE);
+
+	// Blips
 	for (int a = 0; a <= 180; a++) {
 		if (scan_data[a] < MAX_DIST) {
 			float mapped = (float)scan_data[a] / MAX_DIST;
 			int r_blip = (int)(mapped * RADAR_R);
 			float rad = a * PI / 180.0;
-			int bx = CX + r_blip * cos(rad);
-			int by = CY - r_blip * sin(rad);
-			display.fillCircle(bx, by, 2, WHITE);
+			int bx = CX + (int)(r_blip * cos(rad));
+			int by = CY - (int)(r_blip * sin(rad));
+			if (bx >= 0 && bx < SCREEN_WIDTH && by >= 0 && by < SCREEN_HEIGHT)
+				display.fillCircle(bx, by, 2, WHITE);
 		}
 	}
 
-	// Distance readout on right side
+	// Angle + distance overlay — bottom strip
 	display.setTextSize(1);
 	display.setTextColor(WHITE);
-	display.setCursor(72, 0);
+	// angle left-aligned
+	display.setCursor(0, 57);
 	display.print(current_angle);
-	display.print((char)247); // degree symbol
-	display.setCursor(72, 12);
+	display.print((char)247);
+	// distance right-aligned
 	float d = scan_data[current_angle];
-	if (d >= MAX_DIST) display.print("---");
-	else { display.print((int)d); display.print("cm"); }
+	String dist_str = (d >= MAX_DIST) ? "---" : (String((int)d) + "cm");
+	display.setCursor(128 - (dist_str.length() * 6), 57);
+	display.print(dist_str);
 
 	display.display();
 }
@@ -107,7 +130,7 @@ void setup() {
 
 	radar_servo.attach(SERVO_PIN);
 	radar_servo.write(0);
-	delay(1000);
+	delay(800);
 
 	display.begin(SSD1306_SWITCHCAPVCC);
 	display.clearDisplay();
@@ -118,19 +141,14 @@ void setup() {
 
 void loop() {
 	radar_servo.write(current_angle);
-	delay(20); // let servo settle
+	delay(80); // settle time — increase if servo overshoots
 
 	float dist = measure_distance();
-
-	if (dist <= 10 || dist > MAX_DIST) {
-			scan_data[current_angle] = MAX_DIST + 1; // treat as no detection
-	} else {
-			scan_data[current_angle] = (int)dist;
-	}
+	scan_data[current_angle] = (dist > MAX_DIST) ? MAX_DIST + 1 : (int)dist;
 
 	draw_radar();
 
 	current_angle += sweep_dir;
 	if (current_angle >= 180) sweep_dir = -1;
-	if (current_angle <= 0)   sweep_dir = 180;
+	if (current_angle <= 0)   sweep_dir = 1;
 }
